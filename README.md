@@ -13,7 +13,7 @@ Quickstart
 ---
 
 ```
-docker run -i -t stianovrevage/certbot:latest bash
+docker run -i -t antonymarion/certbot:latest bash
 bash-4.3#
 bash-4.3# certbot
 ...certbot output
