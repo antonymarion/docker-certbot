@@ -1,16 +1,16 @@
 """Certbot display."""
 import logging
-import os
-import select
 import sys
 import textwrap
 
 import zope.interface
 
-from certbot import constants
-from certbot import interfaces
 from certbot import errors
-from certbot.display import completer
+from certbot import interfaces
+from certbot._internal import constants
+from certbot._internal.display import completer
+from certbot.compat import misc
+from certbot.compat import os
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,10 @@ HELP = "help"
 ESC = "esc"
 """Display exit code when the user hits Escape (UNUSED)"""
 
+# Display constants
+SIDE_FRAME = ("- " * 39) + "-"
+"""Display boundary (alternates spaces, so when copy-pasted, markdown doesn't interpret
+it as a heading)"""
 
 def _wrap_lines(msg):
     """Format lines nicely to 80 chars.
@@ -49,7 +53,7 @@ def _wrap_lines(msg):
             break_long_words=False,
             break_on_hyphens=False))
 
-    return os.linesep.join(fixed_l)
+    return '\n'.join(fixed_l)
 
 
 def input_with_timeout(prompt=None, timeout=36000.0):
@@ -75,13 +79,8 @@ def input_with_timeout(prompt=None, timeout=36000.0):
         sys.stdout.write(prompt)
         sys.stdout.flush()
 
-    # select can only be used like this on UNIX
-    rlist, _, _ = select.select([sys.stdin], [], [], timeout)
-    if not rlist:
-        raise errors.Error(
-            "Timed out waiting for answer to prompt '{0}'".format(prompt))
+    line = misc.readline_with_timeout(timeout, prompt)
 
-    line = rlist[0].readline()
     if not line:
         raise EOFError
     return line.rstrip('\n')
@@ -90,7 +89,6 @@ def input_with_timeout(prompt=None, timeout=36000.0):
 @zope.interface.implementer(interfaces.IDisplay)
 class FileDisplay(object):
     """File-based display."""
-    # pylint: disable=too-many-arguments
     # see https://github.com/certbot/certbot/issues/3915
 
     def __init__(self, outfile, force_interactive):
@@ -111,12 +109,11 @@ class FileDisplay(object):
             because it won't cause any workflow regressions
 
         """
-        side_frame = "-" * 79
         if wrap:
             message = _wrap_lines(message)
         self.outfile.write(
             "{line}{frame}{line}{msg}{line}{frame}{line}".format(
-                line=os.linesep, frame=side_frame, msg=message))
+                line='\n', frame=SIDE_FRAME, msg=message))
         self.outfile.flush()
         if pause:
             if self._can_interact(force_interactive):
@@ -124,10 +121,9 @@ class FileDisplay(object):
             else:
                 logger.debug("Not pausing for user confirmation")
 
-    def menu(self, message, choices, ok_label=None, cancel_label=None,
-             help_label=None, default=None,
+    def menu(self, message, choices, ok_label=None, cancel_label=None,  # pylint: disable=unused-argument
+             help_label=None, default=None,  # pylint: disable=unused-argument
              cli_flag=None, force_interactive=False, **unused_kwargs):
-        # pylint: disable=unused-argument
         """Display a menu.
 
         .. todo:: This doesn't enable the help label/button (I wasn't sold on
@@ -181,10 +177,9 @@ class FileDisplay(object):
         message = _wrap_lines("%s (Enter 'c' to cancel):" % message) + " "
         ans = input_with_timeout(message)
 
-        if ans == "c" or ans == "C":
+        if ans in ("c", "C"):
             return CANCEL, "-1"
-        else:
-            return OK, ans
+        return OK, ans
 
     def yesno(self, message, yes_label="Yes", no_label="No", default=None,
               cli_flag=None, force_interactive=False, **unused_kwargs):
@@ -208,12 +203,10 @@ class FileDisplay(object):
         if self._return_default(message, default, cli_flag, force_interactive):
             return default
 
-        side_frame = ("-" * 79) + os.linesep
-
         message = _wrap_lines(message)
 
         self.outfile.write("{0}{frame}{msg}{0}{frame}".format(
-            os.linesep, frame=side_frame, msg=message))
+            os.linesep, frame=SIDE_FRAME + os.linesep, msg=message))
         self.outfile.flush()
 
         while True:
@@ -232,7 +225,6 @@ class FileDisplay(object):
 
     def checklist(self, message, tags, default=None,
                   cli_flag=None, force_interactive=False, **unused_kwargs):
-        # pylint: disable=unused-argument
         """Display a checklist.
 
         :param str message: Message to display to user
@@ -260,16 +252,15 @@ class FileDisplay(object):
                                    force_interactive=True)
 
             if code == OK:
-                if len(ans.strip()) == 0:
+                if not ans.strip():
                     ans = " ".join(str(x) for x in range(1, len(tags)+1))
                 indices = separate_list_input(ans)
                 selected_tags = self._scrub_checklist_input(indices, tags)
                 if selected_tags:
                     return code, selected_tags
-                else:
-                    self.outfile.write(
-                        "** Error - Invalid selection **%s" % os.linesep)
-                    self.outfile.flush()
+                self.outfile.write(
+                    "** Error - Invalid selection **%s" % os.linesep)
+                self.outfile.flush()
             else:
                 return code, []
 
@@ -290,18 +281,17 @@ class FileDisplay(object):
         # assert_valid_call(prompt, default, cli_flag, force_interactive)
         if self._can_interact(force_interactive):
             return False
-        elif default is None:
+        if default is None:
             msg = "Unable to get an answer for the question:\n{0}".format(prompt)
             if cli_flag:
                 msg += (
                     "\nYou can provide an answer on the "
                     "command line with the {0} flag.".format(cli_flag))
             raise errors.Error(msg)
-        else:
-            logger.debug(
-                "Falling back to default %s for the prompt:\n%s",
-                default, prompt)
-            return True
+        logger.debug(
+            "Falling back to default %s for the prompt:\n%s",
+            default, prompt)
+        return True
 
     def _can_interact(self, force_interactive):
         """Can we safely interact with the user?
@@ -316,7 +306,7 @@ class FileDisplay(object):
         if (self.force_interactive or force_interactive or
                 sys.stdin.isatty() and self.outfile.isatty()):
             return True
-        elif not self.skipped_interaction:
+        if not self.skipped_interaction:
             logger.warning(
                 "Skipped user interaction because Certbot doesn't appear to "
                 "be running in a terminal. You should probably include "
@@ -344,7 +334,6 @@ class FileDisplay(object):
             return self.input(message, default, cli_flag, force_interactive)
 
     def _scrub_checklist_input(self, indices, tags):
-        # pylint: disable=no-self-use
         """Validate input and transform indices to appropriate tags.
 
         :param list indices: input
@@ -386,8 +375,7 @@ class FileDisplay(object):
         # Write out the message to the user
         self.outfile.write(
             "{new}{msg}{new}".format(new=os.linesep, msg=message))
-        side_frame = ("-" * 79) + os.linesep
-        self.outfile.write(side_frame)
+        self.outfile.write(SIDE_FRAME + os.linesep)
 
         # Write out the menu choices
         for i, desc in enumerate(choices, 1):
@@ -397,7 +385,7 @@ class FileDisplay(object):
             # Keep this outside of the textwrap
             self.outfile.write(os.linesep)
 
-        self.outfile.write(side_frame)
+        self.outfile.write(SIDE_FRAME + os.linesep)
         self.outfile.flush()
 
     def _get_valid_int_ans(self, max_):
@@ -473,8 +461,7 @@ class NoninteractiveDisplay(object):
             msg += "\n\n(You can set this with the {0} flag)".format(cli_flag)
         raise errors.MissingCommandlineFlag(msg)
 
-    def notification(self, message, pause=False, wrap=True, **unused_kwargs):
-        # pylint: disable=unused-argument
+    def notification(self, message, pause=False, wrap=True, **unused_kwargs):  # pylint: disable=unused-argument
         """Displays a notification without waiting for user acceptance.
 
         :param str message: Message to display to stdout
@@ -482,17 +469,16 @@ class NoninteractiveDisplay(object):
         :param bool wrap: Whether or not the application should wrap text
 
         """
-        side_frame = "-" * 79
         if wrap:
             message = _wrap_lines(message)
         self.outfile.write(
             "{line}{frame}{line}{msg}{line}{frame}{line}".format(
-                line=os.linesep, frame=side_frame, msg=message))
+                line=os.linesep, frame=SIDE_FRAME, msg=message))
         self.outfile.flush()
 
     def menu(self, message, choices, ok_label=None, cancel_label=None,
              help_label=None, default=None, cli_flag=None, **unused_kwargs):
-        # pylint: disable=unused-argument,too-many-arguments
+        # pylint: disable=unused-argument
         """Avoid displaying a menu.
 
         :param str message: title of menu
@@ -528,12 +514,10 @@ class NoninteractiveDisplay(object):
         """
         if default is None:
             self._interaction_fail(message, cli_flag)
-        else:
-            return OK, default
+        return OK, default
 
-    def yesno(self, message, yes_label=None, no_label=None,
+    def yesno(self, message, yes_label=None, no_label=None,  # pylint: disable=unused-argument
               default=None, cli_flag=None, **unused_kwargs):
-        # pylint: disable=unused-argument
         """Decide Yes or No, without asking anybody
 
         :param str message: question for the user
@@ -546,8 +530,7 @@ class NoninteractiveDisplay(object):
         """
         if default is None:
             self._interaction_fail(message, cli_flag)
-        else:
-            return default
+        return default
 
     def checklist(self, message, tags, default=None,
                   cli_flag=None, **unused_kwargs):
@@ -565,8 +548,7 @@ class NoninteractiveDisplay(object):
         """
         if default is None:
             self._interaction_fail(message, cli_flag, "? ".join(tags))
-        else:
-            return OK, default
+        return OK, default
 
     def directory_select(self, message, default=None,
                          cli_flag=None, **unused_kwargs):

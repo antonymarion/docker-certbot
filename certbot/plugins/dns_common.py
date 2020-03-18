@@ -2,16 +2,16 @@
 
 import abc
 import logging
-import os
-import stat
 from time import sleep
 
 import configobj
 import zope.interface
-from acme import challenges
 
+from acme import challenges
 from certbot import errors
 from certbot import interfaces
+from certbot.compat import filesystem
+from certbot.compat import os
 from certbot.display import ops
 from certbot.display import util as display_util
 from certbot.plugins import common
@@ -37,13 +37,13 @@ class DNSAuthenticator(common.Plugin):
             help='The number of seconds to wait for DNS to propagate before asking the ACME server '
                  'to verify the DNS record.')
 
-    def get_chall_pref(self, unused_domain): # pylint: disable=missing-docstring,no-self-use
+    def get_chall_pref(self, unused_domain):  # pylint: disable=missing-function-docstring
         return [challenges.DNS01]
 
-    def prepare(self): # pylint: disable=missing-docstring
+    def prepare(self): # pylint: disable=missing-function-docstring
         pass
 
-    def perform(self, achalls): # pylint: disable=missing-docstring
+    def perform(self, achalls): # pylint: disable=missing-function-docstring
         self._setup_credentials()
 
         self._attempt_cleanup = True
@@ -66,7 +66,7 @@ class DNSAuthenticator(common.Plugin):
 
         return responses
 
-    def cleanup(self, achalls):  # pylint: disable=missing-docstring
+    def cleanup(self, achalls):  # pylint: disable=missing-function-docstring
         if self._attempt_cleanup:
             for achall in achalls:
                 domain = achall.domain
@@ -83,7 +83,7 @@ class DNSAuthenticator(common.Plugin):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def _perform(self, domain, validation_domain_name, validation):  # pragma: no cover
+    def _perform(self, domain, validation_name, validation):  # pragma: no cover
         """
         Performs a dns-01 challenge by creating a DNS TXT record.
 
@@ -95,7 +95,7 @@ class DNSAuthenticator(common.Plugin):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def _cleanup(self, domain, validation_domain_name, validation):  # pragma: no cover
+    def _cleanup(self, domain, validation_name, validation):  # pragma: no cover
         """
         Deletes the DNS TXT record which would have been created by `_perform_achall`.
 
@@ -197,8 +197,7 @@ class DNSAuthenticator(common.Plugin):
 
         if code == display_util.OK:
             return response
-        else:
-            raise errors.PluginError('{0} required to proceed.'.format(label))
+        raise errors.PluginError('{0} required to proceed.'.format(label))
 
     @staticmethod
     def _prompt_for_file(label, validator=None):
@@ -231,8 +230,7 @@ class DNSAuthenticator(common.Plugin):
 
         if code == display_util.OK:
             return response
-        else:
-            raise errors.PluginError('{0} required to proceed.'.format(label))
+        raise errors.PluginError('{0} required to proceed.'.format(label))
 
 
 class CredentialsConfiguration(object):
@@ -302,8 +300,8 @@ def validate_file(filename):
     if not os.path.exists(filename):
         raise errors.PluginError('File not found: {0}'.format(filename))
 
-    if not os.path.isfile(filename):
-        raise errors.PluginError('Path is not a file: {0}'.format(filename))
+    if os.path.isdir(filename):
+        raise errors.PluginError('Path is a directory: {0}'.format(filename))
 
 
 def validate_file_permissions(filename):
@@ -311,8 +309,7 @@ def validate_file_permissions(filename):
 
     validate_file(filename)
 
-    permissions = stat.S_IMODE(os.stat(filename).st_mode)
-    if permissions & stat.S_IRWXO:
+    if filesystem.has_world_permissions(filename):
         logger.warning('Unsafe permissions on credentials configuration file: %s', filename)
 
 

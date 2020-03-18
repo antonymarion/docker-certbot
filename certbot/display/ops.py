@@ -1,12 +1,13 @@
 """Contains UI methods for LE user operations."""
 import logging
-import os
 
 import zope.component
 
 from certbot import errors
 from certbot import interfaces
 from certbot import util
+from certbot.compat import misc
+from certbot.compat import os
 from certbot.display import util as display_util
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,8 @@ def get_email(invalid=False, optional=True):
     unsafe_suggestion = ("\n\nIf you really want to skip this, you can run "
                          "the client with --register-unsafely-without-email "
                          "but make sure you then backup your account key from "
-                         "/etc/letsencrypt/accounts\n\n")
+                         "{0}\n\n".format(os.path.join(
+                             misc.get_default_folder('config'), 'accounts')))
     if optional:
         if invalid:
             msg += unsafe_suggestion
@@ -58,11 +60,10 @@ def get_email(invalid=False, optional=True):
                 raise errors.Error(
                     "An e-mail address or "
                     "--register-unsafely-without-email must be provided.")
-            else:
-                raise errors.Error("An e-mail address must be provided.")
-        elif util.safe_email(email):
+            raise errors.Error("An e-mail address must be provided.")
+        if util.safe_email(email):
             return email
-        elif suggest_unsafe:
+        if suggest_unsafe:
             msg += unsafe_suggestion
             suggest_unsafe = False  # add this message at most once
 
@@ -73,7 +74,7 @@ def choose_account(accounts):
     """Choose an account.
 
     :param list accounts: Containing at least one
-        :class:`~certbot.account.Account`
+        :class:`~certbot._internal.account.Account`
 
     """
     # Note this will get more complicated once we start recording authorizations
@@ -83,15 +84,31 @@ def choose_account(accounts):
         "Please choose an account", labels, force_interactive=True)
     if code == display_util.OK:
         return accounts[index]
-    else:
-        return None
+    return None
 
+def choose_values(values, question=None):
+    """Display screen to let user pick one or multiple values from the provided
+    list.
 
-def choose_names(installer):
+    :param list values: Values to select from
+
+    :returns: List of selected values
+    :rtype: list
+    """
+    code, items = z_util(interfaces.IDisplay).checklist(
+        question, tags=values, force_interactive=True)
+    if code == display_util.OK and items:
+        return items
+    return []
+
+def choose_names(installer, question=None):
     """Display screen to select domains to validate.
 
     :param installer: An installer object
     :type installer: :class:`certbot.interfaces.IInstaller`
+
+    :param `str` question: Overriding default question to ask the user if asked
+        to choose from domain names.
 
     :returns: List of selected names
     :rtype: `list` of `str`
@@ -108,11 +125,10 @@ def choose_names(installer):
         return _choose_names_manually(
             "No names were found in your configuration files. ")
 
-    code, names = _filter_names(names)
+    code, names = _filter_names(names, question)
     if code == display_util.OK and names:
         return names
-    else:
-        return []
+    return []
 
 
 def get_valid_domains(domains):
@@ -142,7 +158,7 @@ def _sort_names(FQDNs):
     return sorted(FQDNs, key=lambda fqdn: fqdn.split('.')[::-1][1:])
 
 
-def _filter_names(names):
+def _filter_names(names, override_question=None):
     """Determine which names the user would like to select from a list.
 
     :param list names: domain names
@@ -155,10 +171,12 @@ def _filter_names(names):
     """
     #Sort by domain first, and then by subdomain
     sorted_names = _sort_names(names)
-
+    if override_question:
+        question = override_question
+    else:
+        question = "Which names would you like to activate HTTPS for?"
     code, names = z_util(interfaces.IDisplay).checklist(
-        "Which names would you like to activate HTTPS for?",
-        tags=sorted_names, cli_flag="--domains", force_interactive=True)
+        question, tags=sorted_names, cli_flag="--domains", force_interactive=True)
     return code, [str(s) for s in names]
 
 
@@ -194,7 +212,7 @@ def _choose_names_manually(prompt_prefix=""):
             except errors.ConfigurationError as e:
                 invalid_domains[domain] = str(e)
 
-        if len(invalid_domains):
+        if invalid_domains:
             retry_message = (
                 "One or more of the entered domain names was not valid:"
                 "{0}{0}").format(os.linesep)
@@ -273,7 +291,7 @@ def _gen_ssl_lab_urls(domains):
 def _gen_https_names(domains):
     """Returns a string of the https domains.
 
-    Domains are formatted nicely with https:// prepended to each.
+    Domains are formatted nicely with ``https://`` prepended to each.
 
     :param list domains: Each domain is a 'str'
 
@@ -322,7 +340,7 @@ def validated_input(validator, *args, **kwargs):
     """Like `~certbot.interfaces.IDisplay.input`, but with validation.
 
     :param callable validator: A method which will be called on the
-        supplied input. If the method raises a `errors.Error`, its
+        supplied input. If the method raises an `errors.Error`, its
         text will be displayed and the user will be re-prompted.
     :param list `*args`: Arguments to be passed to `~certbot.interfaces.IDisplay.input`.
     :param dict `**kwargs`: Arguments to be passed to `~certbot.interfaces.IDisplay.input`.
@@ -337,7 +355,7 @@ def validated_directory(validator, *args, **kwargs):
     """Like `~certbot.interfaces.IDisplay.directory_select`, but with validation.
 
     :param callable validator: A method which will be called on the
-        supplied input. If the method raises a `errors.Error`, its
+        supplied input. If the method raises an `errors.Error`, its
         text will be displayed and the user will be re-prompted.
     :param list `*args`: Arguments to be passed to `~certbot.interfaces.IDisplay.directory_select`.
     :param dict `**kwargs`: Arguments to be passed to

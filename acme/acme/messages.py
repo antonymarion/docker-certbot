@@ -1,32 +1,57 @@
 """ACME protocol messages."""
-import collections
-import six
+import json
 
 import josepy as jose
+import six
 
 from acme import challenges
 from acme import errors
 from acme import fields
+from acme import jws
 from acme import util
+from acme.mixins import ResourceMixin
+
+try:
+    from collections.abc import Hashable
+except ImportError:  # pragma: no cover
+    from collections import Hashable
+
+
 
 OLD_ERROR_PREFIX = "urn:acme:error:"
 ERROR_PREFIX = "urn:ietf:params:acme:error:"
 
 ERROR_CODES = {
+    'accountDoesNotExist': 'The request specified an account that does not exist',
+    'alreadyRevoked': 'The request specified a certificate to be revoked that has' \
+    ' already been revoked',
     'badCSR': 'The CSR is unacceptable (e.g., due to a short key)',
     'badNonce': 'The client sent an unacceptable anti-replay nonce',
+    'badPublicKey': 'The JWS was signed by a public key the server does not support',
+    'badRevocationReason': 'The revocation reason provided is not allowed by the server',
+    'badSignatureAlgorithm': 'The JWS was signed with an algorithm the server does not support',
+    'caa': 'Certification Authority Authorization (CAA) records forbid the CA from issuing' \
+    ' a certificate',
+    'compound': 'Specific error conditions are indicated in the "subproblems" array',
     'connection': ('The server could not connect to the client to verify the'
                    ' domain'),
+    'dns': 'There was a problem with a DNS query during identifier validation',
     'dnssec': 'The server could not validate a DNSSEC signed domain',
+    'incorrectResponse': 'Response received didn\'t match the challenge\'s requirements',
     # deprecate invalidEmail
     'invalidEmail': 'The provided email for a registration was invalid',
     'invalidContact': 'The provided contact URI was invalid',
     'malformed': 'The request message was malformed',
+    'rejectedIdentifier': 'The server will not issue certificates for the identifier',
+    'orderNotReady': 'The request attempted to finalize an order that is not ready to be finalized',
     'rateLimited': 'There were too many requests of a given type',
     'serverInternal': 'The server experienced an internal error',
     'tls': 'The server experienced a TLS error during domain verification',
     'unauthorized': 'The client lacks sufficient authorization',
+    'unsupportedContact': 'A contact URL for an account used an unsupported protocol scheme',
     'unknownHost': 'The server could not resolve a domain name',
+    'unsupportedIdentifier': 'An identifier is of an unsupported type',
+    'externalAccountRequired': 'The server requires external account binding',
 }
 
 ERROR_TYPE_DESCRIPTIONS = dict(
@@ -40,8 +65,7 @@ def is_acme_error(err):
     """Check if argument is an ACME error."""
     if isinstance(err, Error) and (err.typ is not None):
         return (ERROR_PREFIX in err.typ) or (OLD_ERROR_PREFIX in err.typ)
-    else:
-        return False
+    return False
 
 
 @six.python_2_unicode_compatible
@@ -96,6 +120,7 @@ class Error(jose.JSONObjectWithFields, errors.Error):
         code = str(self.typ).split(':')[-1]
         if code in ERROR_CODES:
             return code
+        return None
 
     def __str__(self):
         return b' :: '.join(
@@ -104,24 +129,25 @@ class Error(jose.JSONObjectWithFields, errors.Error):
             if part is not None).decode()
 
 
-class _Constant(jose.JSONDeSerializable, collections.Hashable):  # type: ignore
+class _Constant(jose.JSONDeSerializable, Hashable):  # type: ignore
     """ACME constant."""
     __slots__ = ('name',)
     POSSIBLE_NAMES = NotImplemented
 
     def __init__(self, name):
-        self.POSSIBLE_NAMES[name] = self
+        super(_Constant, self).__init__()
+        self.POSSIBLE_NAMES[name] = self  # pylint: disable=unsupported-assignment-operation
         self.name = name
 
     def to_partial_json(self):
         return self.name
 
     @classmethod
-    def from_json(cls, value):
-        if value not in cls.POSSIBLE_NAMES:
+    def from_json(cls, jobj):
+        if jobj not in cls.POSSIBLE_NAMES:  # pylint: disable=unsupported-membership-test
             raise jose.DeserializationError(
                 '{0} not recognized'.format(cls.__name__))
-        return cls.POSSIBLE_NAMES[value]
+        return cls.POSSIBLE_NAMES[jobj]
 
     def __repr__(self):
         return '{0}({1})'.format(self.__class__.__name__, self.name)
@@ -145,6 +171,8 @@ STATUS_PROCESSING = Status('processing')
 STATUS_VALID = Status('valid')
 STATUS_INVALID = Status('invalid')
 STATUS_REVOKED = Status('revoked')
+STATUS_READY = Status('ready')
+STATUS_DEACTIVATED = Status('deactivated')
 
 
 class IdentifierType(_Constant):
@@ -171,9 +199,30 @@ class Directory(jose.JSONDeSerializable):
 
     class Meta(jose.JSONObjectWithFields):
         """Directory Meta."""
-        terms_of_service = jose.Field('terms-of-service', omitempty=True)
+        _terms_of_service = jose.Field('terms-of-service', omitempty=True)
+        _terms_of_service_v2 = jose.Field('termsOfService', omitempty=True)
         website = jose.Field('website', omitempty=True)
-        caa_identities = jose.Field('caa-identities', omitempty=True)
+        caa_identities = jose.Field('caaIdentities', omitempty=True)
+        external_account_required = jose.Field('externalAccountRequired', omitempty=True)
+
+        def __init__(self, **kwargs):
+            kwargs = dict((self._internal_name(k), v) for k, v in kwargs.items())
+            super(Directory.Meta, self).__init__(**kwargs)
+
+        @property
+        def terms_of_service(self):
+            """URL for the CA TOS"""
+            return self._terms_of_service or self._terms_of_service_v2
+
+        def __iter__(self):
+            # When iterating over fields, use the external name 'terms_of_service' instead of
+            # the internal '_terms_of_service'.
+            for name in super(Directory.Meta, self).__iter__():
+                yield name[1:] if name == '_terms_of_service' else name
+
+        def _internal_name(self, name):
+            return '_' + name if name == 'terms_of_service' else name
+
 
     @classmethod
     def _canon_key(cls, key):
@@ -197,13 +246,13 @@ class Directory(jose.JSONDeSerializable):
         try:
             return self[name.replace('_', '-')]
         except KeyError as error:
-            raise AttributeError(str(error) + ': ' + name)
+            raise AttributeError(str(error))
 
     def __getitem__(self, name):
         try:
             return self._jobj[self._canon_key(name)]
         except KeyError:
-            raise KeyError('Directory field not found')
+            raise KeyError('Directory field "' + self._canon_key(name) + '" not found')
 
     def to_partial_json(self):
         return self._jobj
@@ -236,6 +285,24 @@ class ResourceBody(jose.JSONObjectWithFields):
     """ACME Resource Body."""
 
 
+class ExternalAccountBinding(object):
+    """ACME External Account Binding"""
+
+    @classmethod
+    def from_data(cls, account_public_key, kid, hmac_key, directory):
+        """Create External Account Binding Resource from contact details, kid and hmac."""
+
+        key_json = json.dumps(account_public_key.to_partial_json()).encode()
+        decoded_hmac_key = jose.b64.b64decode(hmac_key)
+        url = directory["newAccount"]
+
+        eab = jws.JWS.sign(key_json, jose.jwk.JWKOct(key=decoded_hmac_key),
+                           jose.jwa.HS256, None,
+                           url, kid)
+
+        return eab.to_partial_json()
+
+
 class Registration(ResourceBody):
     """Registration Resource Body.
 
@@ -251,24 +318,31 @@ class Registration(ResourceBody):
     contact = jose.Field('contact', omitempty=True, default=())
     agreement = jose.Field('agreement', omitempty=True)
     status = jose.Field('status', omitempty=True)
+    terms_of_service_agreed = jose.Field('termsOfServiceAgreed', omitempty=True)
+    only_return_existing = jose.Field('onlyReturnExisting', omitempty=True)
+    external_account_binding = jose.Field('externalAccountBinding', omitempty=True)
 
     phone_prefix = 'tel:'
     email_prefix = 'mailto:'
 
     @classmethod
-    def from_data(cls, phone=None, email=None, **kwargs):
+    def from_data(cls, phone=None, email=None, external_account_binding=None, **kwargs):
         """Create registration resource from contact details."""
         details = list(kwargs.pop('contact', ()))
         if phone is not None:
             details.append(cls.phone_prefix + phone)
         if email is not None:
-            details.append(cls.email_prefix + email)
+            details.extend([cls.email_prefix + mail for mail in email.split(',')])
         kwargs['contact'] = tuple(details)
+
+        if external_account_binding:
+            kwargs['external_account_binding'] = external_account_binding
+
         return cls(**kwargs)
 
     def _filter_contact(self, prefix):
         return tuple(
-            detail[len(prefix):] for detail in self.contact
+            detail[len(prefix):] for detail in self.contact  # pylint: disable=not-an-iterable
             if detail.startswith(prefix))
 
     @property
@@ -283,13 +357,13 @@ class Registration(ResourceBody):
 
 
 @Directory.register
-class NewRegistration(Registration):
+class NewRegistration(ResourceMixin, Registration):
     """New registration."""
     resource_type = 'new-reg'
     resource = fields.Resource(resource_type)
 
 
-class UpdateRegistration(Registration):
+class UpdateRegistration(ResourceMixin, Registration):
     """Update registration."""
     resource_type = 'reg'
     resource = fields.Resource(resource_type)
@@ -340,7 +414,6 @@ class ChallengeBody(ResourceBody):
 
     def __init__(self, **kwargs):
         kwargs = dict((self._internal_name(k), v) for k, v in kwargs.items())
-        # pylint: disable=star-args
         super(ChallengeBody, self).__init__(**kwargs)
 
     def encode(self, name):
@@ -388,7 +461,6 @@ class ChallengeResource(Resource):
     @property
     def uri(self):
         """The URL of the challenge body."""
-        # pylint: disable=function-redefined,no-member
         return self.body.uri
 
 
@@ -403,7 +475,7 @@ class Authorization(ResourceBody):
     :ivar datetime.datetime expires:
 
     """
-    identifier = jose.Field('identifier', decoder=Identifier.from_json)
+    identifier = jose.Field('identifier', decoder=Identifier.from_json, omitempty=True)
     challenges = jose.Field('challenges', omitempty=True)
     combinations = jose.Field('combinations', omitempty=True)
 
@@ -413,22 +485,29 @@ class Authorization(ResourceBody):
     # be absent'... then acme-spec gives example with 'expires'
     # present... That's confusing!
     expires = fields.RFC3339Field('expires', omitempty=True)
+    wildcard = jose.Field('wildcard', omitempty=True)
 
     @challenges.decoder
-    def challenges(value):  # pylint: disable=missing-docstring,no-self-argument
+    def challenges(value):  # pylint: disable=no-self-argument,missing-function-docstring
         return tuple(ChallengeBody.from_json(chall) for chall in value)
 
     @property
     def resolved_combinations(self):
         """Combinations with challenges instead of indices."""
         return tuple(tuple(self.challenges[idx] for idx in combo)
-                     for combo in self.combinations)
+                     for combo in self.combinations)  # pylint: disable=not-an-iterable
 
 
 @Directory.register
-class NewAuthorization(Authorization):
+class NewAuthorization(ResourceMixin, Authorization):
     """New authorization."""
     resource_type = 'new-authz'
+    resource = fields.Resource(resource_type)
+
+
+class UpdateAuthorization(ResourceMixin, Authorization):
+    """Update authorization."""
+    resource_type = 'authz'
     resource = fields.Resource(resource_type)
 
 
@@ -444,7 +523,7 @@ class AuthorizationResource(ResourceWithURI):
 
 
 @Directory.register
-class CertificateRequest(jose.JSONObjectWithFields):
+class CertificateRequest(ResourceMixin, jose.JSONObjectWithFields):
     """ACME new-cert request.
 
     :ivar josepy.util.ComparableX509 csr:
@@ -470,7 +549,7 @@ class CertificateResource(ResourceWithURI):
 
 
 @Directory.register
-class Revocation(jose.JSONObjectWithFields):
+class Revocation(ResourceMixin, jose.JSONObjectWithFields):
     """Revocation message.
 
     :ivar .ComparableX509 certificate: `OpenSSL.crypto.X509` wrapped in
@@ -482,3 +561,49 @@ class Revocation(jose.JSONObjectWithFields):
     certificate = jose.Field(
         'certificate', decoder=jose.decode_cert, encoder=jose.encode_cert)
     reason = jose.Field('reason')
+
+
+class Order(ResourceBody):
+    """Order Resource Body.
+
+    :ivar list of .Identifier: List of identifiers for the certificate.
+    :ivar acme.messages.Status status:
+    :ivar list of str authorizations: URLs of authorizations.
+    :ivar str certificate: URL to download certificate as a fullchain PEM.
+    :ivar str finalize: URL to POST to to request issuance once all
+        authorizations have "valid" status.
+    :ivar datetime.datetime expires: When the order expires.
+    :ivar .Error error: Any error that occurred during finalization, if applicable.
+    """
+    identifiers = jose.Field('identifiers', omitempty=True)
+    status = jose.Field('status', decoder=Status.from_json,
+                        omitempty=True)
+    authorizations = jose.Field('authorizations', omitempty=True)
+    certificate = jose.Field('certificate', omitempty=True)
+    finalize = jose.Field('finalize', omitempty=True)
+    expires = fields.RFC3339Field('expires', omitempty=True)
+    error = jose.Field('error', omitempty=True, decoder=Error.from_json)
+
+    @identifiers.decoder
+    def identifiers(value):  # pylint: disable=no-self-argument,missing-function-docstring
+        return tuple(Identifier.from_json(identifier) for identifier in value)
+
+class OrderResource(ResourceWithURI):
+    """Order Resource.
+
+    :ivar acme.messages.Order body:
+    :ivar str csr_pem: The CSR this Order will be finalized with.
+    :ivar list of acme.messages.AuthorizationResource authorizations:
+        Fully-fetched AuthorizationResource objects.
+    :ivar str fullchain_pem: The fetched contents of the certificate URL
+        produced once the order was finalized, if it's present.
+    """
+    body = jose.Field('body', decoder=Order.from_json)
+    csr_pem = jose.Field('csr_pem', omitempty=True)
+    authorizations = jose.Field('authorizations')
+    fullchain_pem = jose.Field('fullchain_pem', omitempty=True)
+
+@Directory.register
+class NewOrder(Order):
+    """New order."""
+    resource_type = 'new-order'

@@ -5,8 +5,8 @@
 # docker run -i -t certbot:latest bash
 # 
 # Tag and push to Docker hub:
-# docker tag certbot:latest stianovrevage/certbot:latest
-# docker push stianovrevage/certbot:latest
+# docker tag certbot:latest antonymarion/certbot:latest
+# docker push antonymarion/certbot:latest
 
 FROM python:2-alpine
 
@@ -23,7 +23,6 @@ COPY certbot src/certbot
 
 RUN apk add --no-cache --virtual .certbot-deps \
         libffi \
-        libssl1.0 \
         openssl \
         ca-certificates \
         binutils \

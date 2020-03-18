@@ -1,22 +1,25 @@
 """Plugin common functions."""
 import logging
-import os
 import re
 import shutil
+import sys
 import tempfile
+import warnings
 
-import OpenSSL
+from josepy import util as jose_util
 import pkg_resources
 import zope.interface
 
-from josepy import util as jose_util
-
-from certbot import constants
+from acme.magic_typing import List
+from certbot import achallenges  # pylint: disable=unused-import
 from certbot import crypto_util
 from certbot import errors
 from certbot import interfaces
 from certbot import reverter
-from certbot import util
+from certbot._internal import constants
+from certbot.compat import filesystem
+from certbot.compat import os
+from certbot.plugins.storage import PluginStorage
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +32,7 @@ def option_namespace(name):
 def dest_namespace(name):
     """ArgumentParser dest namespace (prefix of all destinations)."""
     return name.replace("-", "_") + "_"
+
 
 private_ips_regex = re.compile(
     r"(^127\.0\.0\.1)|(^10\.)|(^172\.1[6-9]\.)|"
@@ -70,7 +74,6 @@ class Plugin(object):
         """
         # dummy function, doesn't check if dest.startswith(self.dest_namespace)
         def add(arg_name_no_prefix, *args, **kwargs):
-            # pylint: disable=missing-docstring
             return parser.add_argument(
                 "--{0}{1}".format(option_namespace(name), arg_name_no_prefix),
                 *args, **kwargs)
@@ -99,7 +102,6 @@ class Plugin(object):
     def conf(self, var):
         """Find a configuration value for variable ``var``."""
         return getattr(self.config, self.dest(var))
-# other
 
 
 class Installer(Plugin):
@@ -110,6 +112,7 @@ class Installer(Plugin):
     """
     def __init__(self, *args, **kwargs):
         super(Installer, self).__init__(*args, **kwargs)
+        self.storage = PluginStorage(self.config, self.name)
         self.reverter = reverter.Reverter(self.config)
 
     def add_to_checkpoint(self, save_files, save_notes, temporary=False):
@@ -182,18 +185,6 @@ class Installer(Plugin):
         """
         try:
             self.reverter.rollback_checkpoints(rollback)
-        except errors.ReverterError as err:
-            raise errors.PluginError(str(err))
-
-    def view_config_changes(self):
-        """Show all of the configuration changes that have taken place.
-
-        :raises .errors.PluginError: If there is a problem while processing
-            the checkpoints directories.
-
-        """
-        try:
-            self.reverter.view_config_changes()
         except errors.ReverterError as err:
             raise errors.PluginError(str(err))
 
@@ -297,14 +288,13 @@ class Addr(object):
             # too long, truncate
             addr_list = addr_list[0:len(result)]
         append_to_end = False
-        for i in range(0, len(addr_list)):
-            block = addr_list[i]
-            if len(block) == 0:
+        for i, block in enumerate(addr_list):
+            if not block:
                 # encountered ::, so rest of the blocks should be
                 # appended to the end
                 append_to_end = True
                 continue
-            elif len(block) > 1:
+            if len(block) > 1:
                 # remove leading zeros
                 block = block.lstrip("0")
             if not append_to_end:
@@ -315,23 +305,28 @@ class Addr(object):
         return result
 
 
-class TLSSNI01(object):
-    """Abstract base for TLS-SNI-01 challenge performers"""
+class ChallengePerformer(object):
+    """Abstract base for challenge performers.
+
+    :ivar configurator: Authenticator and installer plugin
+    :ivar achalls: Annotated challenges
+    :vartype achalls: `list` of `.KeyAuthorizationAnnotatedChallenge`
+    :ivar indices: Holds the indices of challenges from a larger array
+        so the user of the class doesn't have to.
+    :vartype indices: `list` of `int`
+
+    """
 
     def __init__(self, configurator):
         self.configurator = configurator
-        self.achalls = []
-        self.indices = []
-        self.challenge_conf = os.path.join(
-            configurator.config.config_dir, "le_tls_sni_01_cert_challenge.conf")
-        # self.completed = 0
+        self.achalls = []  # type: List[achallenges.KeyAuthorizationAnnotatedChallenge]
+        self.indices = []  # type: List[int]
 
     def add_chall(self, achall, idx=None):
-        """Add challenge to TLSSNI01 object to perform at once.
+        """Store challenge to be performed when perform() is called.
 
         :param .KeyAuthorizationAnnotatedChallenge achall: Annotated
-            TLSSNI01 challenge.
-
+            challenge.
         :param int idx: index to challenge in a larger array
 
         """
@@ -339,51 +334,15 @@ class TLSSNI01(object):
         if idx is not None:
             self.indices.append(idx)
 
-    def get_cert_path(self, achall):
-        """Returns standardized name for challenge certificate.
+    def perform(self):
+        """Perform all added challenges.
 
-        :param .KeyAuthorizationAnnotatedChallenge achall: Annotated
-            tls-sni-01 challenge.
+        :returns: challenge responses
+        :rtype: `list` of `acme.challenges.KeyAuthorizationChallengeResponse`
 
-        :returns: certificate file name
-        :rtype: str
 
         """
-        return os.path.join(self.configurator.config.work_dir,
-                            achall.chall.encode("token") + ".crt")
-
-    def get_key_path(self, achall):
-        """Get standardized path to challenge key."""
-        return os.path.join(self.configurator.config.work_dir,
-                            achall.chall.encode("token") + '.pem')
-
-    def get_z_domain(self, achall):
-        """Returns z_domain (SNI) name for the challenge."""
-        return achall.response(achall.account_key).z_domain.decode("utf-8")
-
-    def _setup_challenge_cert(self, achall, cert_key=None):
-
-        """Generate and write out challenge certificate."""
-        cert_path = self.get_cert_path(achall)
-        key_path = self.get_key_path(achall)
-        # Register the path before you write out the file
-        self.configurator.reverter.register_file_creation(True, key_path)
-        self.configurator.reverter.register_file_creation(True, cert_path)
-
-        response, (cert, key) = achall.response_and_validation(
-            cert_key=cert_key)
-        cert_pem = OpenSSL.crypto.dump_certificate(
-            OpenSSL.crypto.FILETYPE_PEM, cert)
-        key_pem = OpenSSL.crypto.dump_privatekey(
-            OpenSSL.crypto.FILETYPE_PEM, key)
-
-        # Write out challenge cert and key
-        with open(cert_path, "wb") as cert_chall_fd:
-            cert_chall_fd.write(cert_pem)
-        with util.safe_open(key_path, 'wb', chmod=0o400) as key_file:
-            key_file.write(key_pem)
-
-        return response
+        raise NotImplementedError()
 
 
 def install_version_controlled_file(dest_path, digest_path, src_path, all_hashes):
@@ -414,9 +373,9 @@ def install_version_controlled_file(dest_path, digest_path, src_path, all_hashes
     active_file_digest = crypto_util.sha256sum(dest_path)
     if active_file_digest == current_hash: # already up to date
         return
-    elif active_file_digest in all_hashes: # safe to update
+    if active_file_digest in all_hashes: # safe to update
         _install_current_file()
-    else: # has been manually modified, not safe to update
+    else:  # has been manually modified, not safe to update
         # did they modify the current version or an old version?
         if os.path.isfile(digest_path):
             with open(digest_path, "r") as f:
@@ -447,15 +406,15 @@ def dir_setup(test_dir, pkg):  # pragma: no cover
         link, (ex: OS X) such plugins will be confused. This function prevents
         such a case.
         """
-        return os.path.realpath(tempfile.mkdtemp(prefix))
+        return filesystem.realpath(tempfile.mkdtemp(prefix))
 
     temp_dir = expanded_tempdir("temp")
     config_dir = expanded_tempdir("config")
     work_dir = expanded_tempdir("work")
 
-    os.chmod(temp_dir, constants.CONFIG_DIRS_MODE)
-    os.chmod(config_dir, constants.CONFIG_DIRS_MODE)
-    os.chmod(work_dir, constants.CONFIG_DIRS_MODE)
+    filesystem.chmod(temp_dir, constants.CONFIG_DIRS_MODE)
+    filesystem.chmod(config_dir, constants.CONFIG_DIRS_MODE)
+    filesystem.chmod(work_dir, constants.CONFIG_DIRS_MODE)
 
     test_configs = pkg_resources.resource_filename(
         pkg, os.path.join("testdata", test_dir))
@@ -464,3 +423,34 @@ def dir_setup(test_dir, pkg):  # pragma: no cover
         test_configs, os.path.join(temp_dir, test_dir), symlinks=True)
 
     return temp_dir, config_dir, work_dir
+
+
+# This class takes a similar approach to the cryptography project to deprecate attributes
+# in public modules. See the _ModuleWithDeprecation class here:
+# https://github.com/pyca/cryptography/blob/91105952739442a74582d3e62b3d2111365b0dc7/src/cryptography/utils.py#L129
+class _TLSSNI01DeprecationModule(object):
+    """
+    Internal class delegating to a module, and displaying warnings when
+    attributes related to TLS-SNI-01 are accessed.
+    """
+    def __init__(self, module):
+        self.__dict__['_module'] = module
+
+    def __getattr__(self, attr):
+        if attr == 'TLSSNI01':
+            warnings.warn('TLSSNI01 is deprecated and will be removed soon.',
+                          DeprecationWarning, stacklevel=2)
+        return getattr(self._module, attr)
+
+    def __setattr__(self, attr, value):  # pragma: no cover
+        setattr(self._module, attr, value)
+
+    def __delattr__(self, attr):  # pragma: no cover
+        delattr(self._module, attr)
+
+    def __dir__(self):  # pragma: no cover
+        return ['_module'] + dir(self._module)
+
+
+# Patching ourselves to warn about TLS-SNI challenge deprecation and removal.
+sys.modules[__name__] = _TLSSNI01DeprecationModule(sys.modules[__name__])

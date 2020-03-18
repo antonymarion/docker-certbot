@@ -1,33 +1,33 @@
 """Utilities for all Certbot."""
+# distutils.version under virtualenv confuses pylint
+# For more info, see: https://github.com/PyCQA/pylint/issues/73
 import argparse
 import atexit
 import collections
-# distutils.version under virtualenv confuses pylint
-# For more info, see: https://github.com/PyCQA/pylint/issues/73
-import distutils.version  # pylint: disable=import-error,no-name-in-module
+from collections import OrderedDict
+import distutils.version
 import errno
 import logging
-import os
 import platform
 import re
-import six
 import socket
-import stat
 import subprocess
 import sys
 
 import configargparse
+import six
 
-from certbot import constants
+from acme.magic_typing import Tuple
+from acme.magic_typing import Union
 from certbot import errors
-from certbot import lock
+from certbot._internal import constants
+from certbot._internal import lock
+from certbot.compat import filesystem
+from certbot.compat import os
 
-try:
-    from collections import OrderedDict
-except ImportError:  # pragma: no cover
-    # OrderedDict was added in Python 2.7
-    from ordereddict import OrderedDict  # pylint: disable=import-error
-
+_USE_DISTRO = sys.platform.startswith('linux')
+if _USE_DISTRO:
+    import distro
 
 logger = logging.getLogger(__name__)
 
@@ -58,14 +58,14 @@ _INITIAL_PID = os.getpid()
 # the dict are attempted to be cleaned up at program exit. If the
 # program exits before the lock is cleaned up, it is automatically
 # released, but the file isn't deleted.
-_LOCKS = OrderedDict()
+_LOCKS = OrderedDict() # type: OrderedDict[str, lock.LockFile]
 
 
 def run_script(params, log=logger.error):
     """Run the script with the given params.
 
     :param list params: List of parameters to pass to Popen
-    :param logging.Logger log: Logger to use for errors
+    :param callable log: Logger method to use for errors
 
     """
     try:
@@ -91,18 +91,6 @@ def run_script(params, log=logger.error):
     return stdout, stderr
 
 
-def is_exe(path):
-    """Is path an executable file?
-
-    :param str path: path to test
-
-    :returns: True iff path is an executable file
-    :rtype: bool
-
-    """
-    return os.path.isfile(path) and os.access(path, os.X_OK)
-
-
 def exe_exists(exe):
     """Determine whether path/name refers to an executable.
 
@@ -114,11 +102,10 @@ def exe_exists(exe):
     """
     path, _ = os.path.split(exe)
     if path:
-        return is_exe(exe)
-    else:
-        for path in os.environ["PATH"].split(os.pathsep):
-            if is_exe(os.path.join(path, exe)):
-                return True
+        return filesystem.is_executable(exe)
+    for path in os.environ["PATH"].split(os.pathsep):
+        if filesystem.is_executable(os.path.join(path, exe)):
+            return True
 
     return False
 
@@ -145,14 +132,14 @@ def _release_locks():
         except:  # pylint: disable=bare-except
             msg = 'Exception occurred releasing lock: {0!r}'.format(dir_lock)
             logger.debug(msg, exc_info=True)
+    _LOCKS.clear()
 
 
-def set_up_core_dir(directory, mode, uid, strict):
+def set_up_core_dir(directory, mode, strict):
     """Ensure directory exists with proper permissions and is locked.
 
     :param str directory: Path to a directory.
     :param int mode: Directory mode.
-    :param int uid: Directory owner.
     :param bool strict: require directory to be owned by current user
 
     :raises .errors.LockError: if the directory cannot be locked
@@ -160,19 +147,18 @@ def set_up_core_dir(directory, mode, uid, strict):
 
     """
     try:
-        make_or_verify_dir(directory, mode, uid, strict)
+        make_or_verify_dir(directory, mode, strict)
         lock_dir_until_exit(directory)
     except OSError as error:
         logger.debug("Exception was:", exc_info=True)
         raise errors.Error(PERM_ERR_FMT.format(error))
 
 
-def make_or_verify_dir(directory, mode=0o755, uid=0, strict=False):
+def make_or_verify_dir(directory, mode=0o755, strict=False):
     """Make sure directory exists with proper permissions.
 
     :param str directory: Path to a directory.
     :param int mode: Directory mode.
-    :param int uid: Directory owner.
     :param bool strict: require directory to be owned by current user
 
     :raises .errors.Error: if a directory already exists,
@@ -184,49 +170,32 @@ def make_or_verify_dir(directory, mode=0o755, uid=0, strict=False):
 
     """
     try:
-        os.makedirs(directory, mode)
+        filesystem.makedirs(directory, mode)
     except OSError as exception:
         if exception.errno == errno.EEXIST:
-            if strict and not check_permissions(directory, mode, uid):
+            if strict and not filesystem.check_permissions(directory, mode):
                 raise errors.Error(
-                    "%s exists, but it should be owned by user %d with"
-                    "permissions %s" % (directory, uid, oct(mode)))
+                    "%s exists, but it should be owned by current user with"
+                    " permissions %s" % (directory, oct(mode)))
         else:
             raise
 
 
-def check_permissions(filepath, mode, uid=0):
-    """Check file or directory permissions.
-
-    :param str filepath: Path to the tested file (or directory).
-    :param int mode: Expected file mode.
-    :param int uid: Expected file owner.
-
-    :returns: True if `mode` and `uid` match, False otherwise.
-    :rtype: bool
-
-    """
-    file_stat = os.stat(filepath)
-    return stat.S_IMODE(file_stat.st_mode) == mode and file_stat.st_uid == uid
-
-
-def safe_open(path, mode="w", chmod=None, buffering=None):
+def safe_open(path, mode="w", chmod=None):
     """Safely open a file.
 
     :param str path: Path to a file.
     :param str mode: Same os `mode` for `open`.
-    :param int chmod: Same as `mode` for `os.open`, uses Python defaults
+    :param int chmod: Same as `mode` for `filesystem.open`, uses Python defaults
         if ``None``.
-    :param int buffering: Same as `bufsize` for `os.fdopen`, uses Python
-        defaults if ``None``.
 
     """
-    # pylint: disable=star-args
-    open_args = () if chmod is None else (chmod,)
-    fdopen_args = () if buffering is None else (buffering,)
-    return os.fdopen(
-        os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, *open_args),
-        mode, *fdopen_args)
+    open_args = ()  # type: Union[Tuple[()], Tuple[int]]
+    if chmod is not None:
+        open_args = (chmod,)
+    fdopen_args = ()  # type: Union[Tuple[()], Tuple[int]]
+    fd = filesystem.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, *open_args)
+    return os.fdopen(fd, mode, *fdopen_args)
 
 
 def _unique_file(path, filename_pat, count, chmod, mode):
@@ -307,82 +276,50 @@ def get_filtered_names(all_names):
     for name in all_names:
         try:
             filtered_names.add(enforce_le_validity(name))
-        except errors.ConfigurationError as error:
-            logger.debug('Not suggesting name "%s"', name)
-            logger.debug(error)
+        except errors.ConfigurationError:
+            logger.debug('Not suggesting name "%s"', name, exc_info=True)
     return filtered_names
 
-
-def get_os_info(filepath="/etc/os-release"):
+def get_os_info():
     """
     Get OS name and version
 
-    :param str filepath: File path of os-release file
     :returns: (os_name, os_version)
     :rtype: `tuple` of `str`
     """
 
-    if os.path.isfile(filepath):
-        # Systemd os-release parsing might be viable
-        os_name, os_version = get_systemd_os_info(filepath=filepath)
-        if os_name:
-            return (os_name, os_version)
+    return get_python_os_info(pretty=False)
 
-    # Fallback to platform module
-    return get_python_os_info()
-
-
-def get_os_info_ua(filepath="/etc/os-release"):
+def get_os_info_ua():
     """
     Get OS name and version string for User Agent
 
-    :param str filepath: File path of os-release file
     :returns: os_ua
     :rtype: `str`
     """
+    if _USE_DISTRO:
+        os_info = distro.name(pretty=True)
 
-    if os.path.isfile(filepath):
-        os_ua = get_var_from_file("PRETTY_NAME", filepath=filepath)
-        if not os_ua:
-            os_ua = get_var_from_file("NAME", filepath=filepath)
-        if os_ua:
-            return os_ua
+    if not _USE_DISTRO or not os_info:
+        return " ".join(get_python_os_info(pretty=True))
+    return os_info
 
-    # Fallback
-    return " ".join(get_python_os_info())
-
-
-def get_systemd_os_info(filepath="/etc/os-release"):
-    """
-    Parse systemd /etc/os-release for distribution information
-
-    :param str filepath: File path of os-release file
-    :returns: (os_name, os_version)
-    :rtype: `tuple` of `str`
-    """
-
-    os_name = get_var_from_file("ID", filepath=filepath)
-    os_version = get_var_from_file("VERSION_ID", filepath=filepath)
-
-    return (os_name, os_version)
-
-
-def get_systemd_os_like(filepath="/etc/os-release"):
+def get_systemd_os_like():
     """
     Get a list of strings that indicate the distribution likeness to
     other distributions.
 
-    :param str filepath: File path of os-release file
     :returns: List of distribution acronyms
     :rtype: `list` of `str`
     """
 
-    return get_var_from_file("ID_LIKE", filepath).split(" ")
-
+    if _USE_DISTRO:
+        return distro.like().split(" ")
+    return []
 
 def get_var_from_file(varname, filepath="/etc/os-release"):
     """
-    Get single value from systemd /etc/os-release
+    Get single value from a file formatted like systemd /etc/os-release
 
     :param str varname: Name of variable to fetch
     :param str filepath: File path of os-release file
@@ -402,7 +339,6 @@ def get_var_from_file(varname, filepath="/etc/os-release"):
             return _normalize_string(line.strip()[len(var_string):])
     return ""
 
-
 def _normalize_string(orig):
     """
     Helper function for get_var_from_file() to remove quotes
@@ -410,11 +346,12 @@ def _normalize_string(orig):
     """
     return orig.replace('"', '').replace("'", "").strip()
 
-
-def get_python_os_info():
+def get_python_os_info(pretty=False):
     """
     Get Operating System type/distribution and major version
     using python platform module
+
+    :param bool pretty: If the returned OS name should be in longer (pretty) form
 
     :returns: (os_name, os_version)
     :rtype: `tuple` of `str`
@@ -426,9 +363,9 @@ def get_python_os_info():
     )
     os_type, os_ver, _ = info
     os_type = os_type.lower()
-    if os_type.startswith('linux'):
-        info = platform.linux_distribution()
-        # On arch, platform.linux_distribution() is reportedly ('','',''),
+    if os_type.startswith('linux') and _USE_DISTRO:
+        info = distro.linux_distribution(pretty)
+        # On arch, distro.linux_distribution() is reportedly ('','',''),
         # so handle it defensively
         if info[0]:
             os_type = info[0]
@@ -469,16 +406,14 @@ def safe_email(email):
     """Scrub email address before using it."""
     if EMAIL_REGEX.match(email) is not None:
         return not email.startswith(".") and ".." not in email
-    else:
-        logger.warning("Invalid email address: %s.", email)
-        return False
+    logger.warning("Invalid email address: %s.", email)
+    return False
 
 
 class _ShowWarning(argparse.Action):
     """Action to log a warning when an argument is used."""
     def __call__(self, unused1, unused2, unused3, option_string=None):
-        sys.stderr.write(
-            "Use of {0} is deprecated.\n".format(option_string))
+        logger.warning("Use of %s is deprecated.", option_string)
 
 
 def add_deprecated_argument(add_argument, argument_name, nargs):
@@ -498,7 +433,6 @@ def add_deprecated_argument(add_argument, argument_name, nargs):
         # In version 0.12.0 ACTION_TYPES_THAT_DONT_NEED_A_VALUE was
         # changed from a set to a tuple.
         if isinstance(configargparse.ACTION_TYPES_THAT_DONT_NEED_A_VALUE, set):
-            # pylint: disable=no-member
             configargparse.ACTION_TYPES_THAT_DONT_NEED_A_VALUE.add(
                 _ShowWarning)
         else:
@@ -552,16 +486,6 @@ def enforce_domain_sanity(domain):
     :returns: The domain cast to `str`, with ASCII-only contents
     :rtype: str
     """
-    if isinstance(domain, six.text_type):
-        wildcard_marker = u"*."
-    else:
-        wildcard_marker = b"*."
-
-    # Check if there's a wildcard domain
-    if domain.startswith(wildcard_marker):
-        raise errors.ConfigurationError(
-            "Wildcard domains are not supported: {0}".format(domain))
-
     # Unicode
     try:
         if isinstance(domain, six.binary_type):
@@ -609,10 +533,28 @@ def enforce_domain_sanity(domain):
     for l in labels:
         if not l:
             raise errors.ConfigurationError("{0} it contains an empty label.".format(msg))
-        elif len(l) > 63:
+        if len(l) > 63:
             raise errors.ConfigurationError("{0} label {1} is too long.".format(msg, l))
 
     return domain
+
+
+def is_wildcard_domain(domain):
+    """"Is domain a wildcard domain?
+
+    :param domain: domain to check
+    :type domain: `bytes` or `str` or `unicode`
+
+    :returns: True if domain is a wildcard, otherwise, False
+    :rtype: bool
+
+    """
+    if isinstance(domain, six.text_type):
+        wildcard_marker = u"*."
+    else:
+        wildcard_marker = b"*."
+
+    return domain.startswith(wildcard_marker)
 
 
 def get_strict_version(normalized):
@@ -625,7 +567,6 @@ def get_strict_version(normalized):
 
     """
     # strict version ending with "a" and a number designates a pre-release
-    # pylint: disable=no-member
     return distutils.version.StrictVersion(normalized.replace(".dev", "a"))
 
 

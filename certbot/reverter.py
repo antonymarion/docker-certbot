@@ -2,19 +2,18 @@
 import csv
 import glob
 import logging
-import os
 import shutil
+import sys
 import time
 import traceback
 
 import six
-import zope.component
 
-from certbot import constants
 from certbot import errors
-from certbot import interfaces
 from certbot import util
-
+from certbot._internal import constants
+from certbot.compat import filesystem
+from certbot.compat import os
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +64,7 @@ class Reverter(object):
         self.config = config
 
         util.make_or_verify_dir(
-            config.backup_dir, constants.CONFIG_DIRS_MODE, os.geteuid(),
-            self.config.strict_permissions)
+            config.backup_dir, constants.CONFIG_DIRS_MODE, self.config.strict_permissions)
 
     def revert_temporary_config(self):
         """Reload users original configuration files after a temporary save.
@@ -82,8 +80,10 @@ class Reverter(object):
                 self._recover_checkpoint(self.config.temp_checkpoint_dir)
             except errors.ReverterError:
                 # We have a partial or incomplete recovery
-                logger.fatal("Incomplete or failed recovery for %s",
-                             self.config.temp_checkpoint_dir)
+                logger.critical(
+                    "Incomplete or failed recovery for %s",
+                    self.config.temp_checkpoint_dir,
+                )
                 raise errors.ReverterError("Unable to revert temporary config")
 
     def rollback_checkpoints(self, rollback=1):
@@ -123,65 +123,10 @@ class Reverter(object):
             try:
                 self._recover_checkpoint(cp_dir)
             except errors.ReverterError:
-                logger.fatal("Failed to load checkpoint during rollback")
+                logger.critical("Failed to load checkpoint during rollback")
                 raise errors.ReverterError(
                     "Unable to load checkpoint during rollback")
             rollback -= 1
-
-    def view_config_changes(self, for_logging=False, num=None):
-        """Displays all saved checkpoints.
-
-        All checkpoints are printed by
-        :meth:`certbot.interfaces.IDisplay.notification`.
-
-        .. todo:: Decide on a policy for error handling, OSError IOError...
-
-        :raises .errors.ReverterError: If invalid directory structure.
-
-        """
-        backups = os.listdir(self.config.backup_dir)
-        backups.sort(reverse=True)
-        if num:
-            backups = backups[:num]
-        if not backups:
-            logger.info("Certbot has not saved backups of your configuration")
-
-            return
-        # Make sure there isn't anything unexpected in the backup folder
-        # There should only be timestamped (float) directories
-        try:
-            for bkup in backups:
-                float(bkup)
-        except ValueError:
-            raise errors.ReverterError(
-                "Invalid directories in {0}".format(self.config.backup_dir))
-
-        output = []
-        for bkup in backups:
-            output.append(time.ctime(float(bkup)))
-            cur_dir = os.path.join(self.config.backup_dir, bkup)
-            with open(os.path.join(cur_dir, "CHANGES_SINCE")) as changes_fd:
-                output.append(changes_fd.read())
-
-            output.append("Affected files:")
-            with open(os.path.join(cur_dir, "FILEPATHS")) as paths_fd:
-                filepaths = paths_fd.read().splitlines()
-                for path in filepaths:
-                    output.append("  {0}".format(path))
-
-            if os.path.isfile(os.path.join(cur_dir, "NEW_FILES")):
-                with open(os.path.join(cur_dir, "NEW_FILES")) as new_fd:
-                    output.append("New Configuration Files:")
-                    filepaths = new_fd.read().splitlines()
-                    for path in filepaths:
-                        output.append("  {0}".format(path))
-
-            output.append(os.linesep)
-
-        if for_logging:
-            return os.linesep.join(output)
-        zope.component.getUtility(interfaces.IDisplay).notification(
-            os.linesep.join(output), force_interactive=True)
 
     def add_to_temp_checkpoint(self, save_files, save_notes):
         """Add files to temporary checkpoint.
@@ -217,8 +162,7 @@ class Reverter(object):
 
         """
         util.make_or_verify_dir(
-            cp_dir, constants.CONFIG_DIRS_MODE, os.geteuid(),
-            self.config.strict_permissions)
+            cp_dir, constants.CONFIG_DIRS_MODE, self.config.strict_permissions)
 
         op_fd, existing_filepaths = self._read_and_append(
             os.path.join(cp_dir, "FILEPATHS"))
@@ -235,7 +179,7 @@ class Reverter(object):
                 try:
                     shutil.copy2(filename, os.path.join(
                         cp_dir, os.path.basename(filename) + "_" + str(idx)))
-                    op_fd.write(filename + os.linesep)
+                    op_fd.write('{0}\n'.format(filename))
                 # http://stackoverflow.com/questions/4726260/effective-use-of-python-shutil-copy2
                 except IOError:
                     op_fd.close()
@@ -251,7 +195,7 @@ class Reverter(object):
         with open(os.path.join(cp_dir, "CHANGES_SINCE"), "a") as notes_fd:
             notes_fd.write(save_notes)
 
-    def _read_and_append(self, filepath):  # pylint: disable=no-self-use
+    def _read_and_append(self, filepath):
         """Reads the file lines and returns a file obj.
 
         Read the file returning the lines, and a pointer to the end of the file.
@@ -306,11 +250,14 @@ class Reverter(object):
             raise errors.ReverterError(
                 "Unable to remove directory: %s" % cp_dir)
 
-    def _run_undo_commands(self, filepath):  # pylint: disable=no-self-use
+    def _run_undo_commands(self, filepath):
         """Run all commands in a file."""
         # NOTE: csv module uses native strings. That is, bytes on Python 2 and
         # unicode on Python 3
-        with open(filepath, 'r') as csvfile:
+        # It is strongly advised to set newline = '' on Python 3 with CSV,
+        # and it fixes problems on Windows.
+        kwargs = {'newline': ''} if sys.version_info[0] > 2 else {}
+        with open(filepath, 'r', **kwargs) as csvfile:  # type: ignore
             csvreader = csv.reader(csvfile)
             for command in reversed(list(csvreader)):
                 try:
@@ -379,7 +326,7 @@ class Reverter(object):
 
             for path in files:
                 if path not in ex_files:
-                    new_fd.write("{0}{1}".format(path, os.linesep))
+                    new_fd.write("{0}\n".format(path))
         except (IOError, OSError):
             logger.error("Unable to register file creation(s) - %s", files)
             raise errors.ReverterError(
@@ -406,11 +353,14 @@ class Reverter(object):
         """
         commands_fp = os.path.join(self._get_cp_dir(temporary), "COMMANDS")
         command_file = None
+        # It is strongly advised to set newline = '' on Python 3 with CSV,
+        # and it fixes problems on Windows.
+        kwargs = {'newline': ''} if sys.version_info[0] > 2 else {}
         try:
             if os.path.isfile(commands_fp):
-                command_file = open(commands_fp, "a")
+                command_file = open(commands_fp, "a", **kwargs)  # type: ignore
             else:
-                command_file = open(commands_fp, "w")
+                command_file = open(commands_fp, "w", **kwargs)  # type: ignore
 
             csvwriter = csv.writer(command_file)
             csvwriter.writerow(command)
@@ -431,8 +381,7 @@ class Reverter(object):
             cp_dir = self.config.in_progress_dir
 
         util.make_or_verify_dir(
-            cp_dir, constants.CONFIG_DIRS_MODE, os.geteuid(),
-            self.config.strict_permissions)
+            cp_dir, constants.CONFIG_DIRS_MODE, self.config.strict_permissions)
 
         return cp_dir
 
@@ -457,14 +406,14 @@ class Reverter(object):
                 self._recover_checkpoint(self.config.in_progress_dir)
             except errors.ReverterError:
                 # We have a partial or incomplete recovery
-                logger.fatal("Incomplete or failed recovery for IN_PROGRESS "
+                logger.critical("Incomplete or failed recovery for IN_PROGRESS "
                              "checkpoint - %s",
                              self.config.in_progress_dir)
                 raise errors.ReverterError(
                     "Incomplete or failed recovery for IN_PROGRESS checkpoint "
                     "- %s" % self.config.in_progress_dir)
 
-    def _remove_contained_files(self, file_list):  # pylint: disable=no-self-use
+    def _remove_contained_files(self, file_list):
         """Erase all files contained within file_list.
 
         :param str file_list: file containing list of file paths to be deleted
@@ -490,11 +439,11 @@ class Reverter(object):
                         os.remove(path)
                     else:
                         logger.warning(
-                            "File: %s - Could not be found to be deleted %s - "
-                            "Certbot probably shut down unexpectedly",
-                            os.linesep, path)
+                            "File: %s - Could not be found to be deleted\n"
+                            " - Certbot probably shut down unexpectedly",
+                            path)
         except (IOError, OSError):
-            logger.fatal(
+            logger.critical(
                 "Unable to remove filepaths contained within %s", file_list)
             raise errors.ReverterError(
                 "Unable to remove filepaths contained within "
@@ -573,7 +522,7 @@ class Reverter(object):
             timestamp = self._checkpoint_timestamp()
             final_dir = os.path.join(self.config.backup_dir, timestamp)
             try:
-                os.rename(self.config.in_progress_dir, final_dir)
+                filesystem.replace(self.config.in_progress_dir, final_dir)
                 return
             except OSError:
                 logger.warning("Extreme, unexpected race condition, retrying (%s)", timestamp)
