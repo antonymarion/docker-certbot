@@ -1,7 +1,9 @@
 # docker-certbot
 Interactive (bash) certbot docker image.
 
-Docker image: https://hub.docker.com/r/stianovrevage/certbot/
+Updated previous image with latests sources for ACMEv2 support
+
+Docker image: https://hub.docker.com/r/antonymarion/certbot/
 
 Based on: https://hub.docker.com/r/certbot/certbot/
 
